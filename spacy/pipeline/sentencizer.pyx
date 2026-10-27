@@ -12,6 +12,31 @@ from ..language import Language
 from .pipe import Pipe
 from .senter import senter_score
 
+from libc.stdint cimport uint64_t
+from libcpp.unordered_set cimport unordered_set
+
+
+def _rmcp_sentence_starts_from_arrays(const uint64_t[:, ::1] data, const uint64_t[::1] endings):
+    """Compute the existing state rule over the caller-owned attribute snapshot."""
+    cdef unordered_set[uint64_t] ending_set
+    cdef Py_ssize_t i
+    cdef bint seen_period = False
+    cdef bint is_ending
+    for i in range(endings.shape[0]):
+        ending_set.insert(endings[i])
+    guesses = [False] * data.shape[0]
+    if data.shape[0]:
+        guesses[0] = True
+    for i in range(data.shape[0]):
+        is_ending = ending_set.count(data[i, 0]) != 0
+        if seen_period and not data[i, 1] and not is_ending:
+            guesses[i] = True
+            seen_period = False
+        elif is_ending:
+            seen_period = True
+    return guesses
+
+
 # see #9050
 BACKWARD_OVERWRITE = False
 
