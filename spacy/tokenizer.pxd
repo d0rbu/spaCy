@@ -26,6 +26,7 @@ cdef class Tokenizer:
     # TODO convert to bool in v4
     cdef int _faster_heuristics
     cdef public int max_cache_size
+    cdef bint _rmcp_ascii_word_match
 
     cdef Doc _tokenize_affixes(self, str string, bint with_special_cases)
     cdef int _apply_special_cases(self, Doc doc) except -1

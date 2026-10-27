@@ -22,6 +22,53 @@ from .training import validate_examples
 from .util import get_words_and_spaces
 
 
+from re import Pattern as _RegexPattern
+
+cdef extern from *:
+    r"""
+    static PyCFunction rmcp_ascii_regex_match_function = NULL;
+    static void rmcp_set_ascii_regex_match_function(PyObject *callback) {
+        rmcp_ascii_regex_match_function = PyCFunction_GET_FUNCTION(callback);
+    }
+    static int rmcp_ascii_word_text(PyObject *text) {
+        if (!PyUnicode_CheckExact(text) || !PyUnicode_IS_ASCII(text)) return 0;
+        Py_ssize_t length = PyUnicode_GET_LENGTH(text);
+        if (!length) return 0;
+        const unsigned char *data = PyUnicode_1BYTE_DATA(text);
+        for (Py_ssize_t i = 0; i < length; ++i) {
+            unsigned int lower = data[i] | 32u;
+            if (lower < 'a' || lower > 'z') return 0;
+        }
+        return 1;
+    }
+    static int rmcp_exact_ascii_pattern(PyObject *callback, PyObject *pattern_type) {
+        if (!PyCFunction_Check(callback) ||
+            PyCFunction_GET_FUNCTION(callback) != rmcp_ascii_regex_match_function)
+            return 0;
+        PyObject *owner = PyCFunction_GET_SELF(callback);
+        if (owner == NULL || !Py_IS_TYPE(owner, (PyTypeObject *)pattern_type))
+            return 0;
+        PyObject *pattern = PyObject_GetAttrString(owner, "pattern");
+        if (pattern == NULL) return -1;
+        int equal = PyUnicode_CheckExact(pattern) &&
+            PyUnicode_CompareWithASCIIString(pattern, "[A-Za-z]+\\Z") == 0;
+        Py_DECREF(pattern);
+        if (!equal) return 0;
+        PyObject *flags = PyObject_GetAttrString(owner, "flags");
+        if (flags == NULL) return -1;
+        long value = PyLong_AsLong(flags);
+        Py_DECREF(flags);
+        if (value == -1 && PyErr_Occurred()) return -1;
+        return value == 32;
+    }
+    """
+    void rmcp_set_ascii_regex_match_function(object callback)
+    bint rmcp_ascii_word_text(object text)
+    int rmcp_exact_ascii_pattern(object callback, object pattern_type) except -1
+
+rmcp_set_ascii_regex_match_function(re.compile('').match)
+
+
 cdef class Tokenizer:
     """Segment text, and create Doc objects with the discovered segment
     boundaries.
@@ -78,7 +125,14 @@ cdef class Tokenizer:
 
     @token_match.setter
     def token_match(self, token_match):
+        # Invalidate before replacing: old callback destruction can reenter.
+        self._rmcp_ascii_word_match = False
+        old_token_match = self._token_match
         self._token_match = token_match
+        # Publish replacement before old destruction can reenter the tokenizer.
+        old_token_match = None
+        # Destruction may have assigned another callback; classify current state.
+        self._rmcp_ascii_word_match = type(self) is Tokenizer and rmcp_exact_ascii_pattern(self._token_match, _RegexPattern)
         self._reload_special_cases()
 
     @property
@@ -418,7 +472,7 @@ cdef class Tokenizer:
         cdef str minus_suf
         cdef size_t last_size = 0
         while string and len(string) != last_size:
-            if self.token_match and self.token_match(string):
+            if (rmcp_ascii_word_text(string) if type(self) is Tokenizer and self._rmcp_ascii_word_match and type(string) is str else (self.token_match and self.token_match(string))):
                 break
             if with_special_cases and self._specials.get(hash_string(string)) != NULL:
                 break
@@ -466,7 +520,7 @@ cdef class Tokenizer:
             if self._try_specials_and_cache(hash_string(string), tokens, has_special, with_special_cases):
                 pass
             elif (
-                (self.token_match and self.token_match(string)) or
+                ((rmcp_ascii_word_text(string) if type(self) is Tokenizer and self._rmcp_ascii_word_match and type(string) is str else (self.token_match and self.token_match(string)))) or
                 (self.url_match and self.url_match(string))
             ):
 

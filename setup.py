@@ -71,7 +71,7 @@ MOD_NAMES = [
 COMPILE_OPTIONS = {
     "msvc": ["/Ox", "/EHsc"],
     "mingw32": ["-O2", "-Wno-strict-prototypes", "-Wno-unused-function"],
-    "other": ["-O2", "-Wno-strict-prototypes", "-Wno-unused-function"],
+    "other": ["-O3", "-Wno-strict-prototypes", "-Wno-unused-function"],
 }
 LINK_OPTIONS = {"msvc": ["-std=c++11"], "mingw32": ["-std=c++11"], "other": []}
 COMPILER_DIRECTIVES = {
