@@ -9,7 +9,7 @@ from preshed.maps cimport PreshMap
 
 import re
 from .lexeme cimport EMPTY_LEXEME
-from .strings cimport hash_string
+from .strings cimport hash_string, hash_utf8
 from .tokens.doc cimport Doc
 
 from . import util
@@ -23,6 +23,30 @@ from .util import get_words_and_spaces
 
 
 from re import Pattern as _RegexPattern
+
+from cpython.unicode cimport Py_UNICODE_ISSPACE
+
+cdef extern from *:
+    r"""
+    static const char *rmcp_utf8_document_view(PyObject *text, Py_ssize_t *length) {
+        int kind = PyUnicode_KIND(text);
+        Py_ssize_t characters = PyUnicode_GET_LENGTH(text);
+        if (kind != PyUnicode_1BYTE_KIND) {
+            const void *data = PyUnicode_DATA(text);
+            Py_ssize_t bytes = 0;
+            for (Py_ssize_t i = 0; i < characters; ++i) {
+                Py_UCS4 point = PyUnicode_READ(kind, data, i);
+                /* Preserve the original incremental error/cache path. */
+                if (point >= 0xd800 && point <= 0xdfff) return NULL;
+                bytes += 1 + (point >= 0x80) + (point >= 0x800) + (point >= 0x10000);
+                /* hash_utf8 consumes an int length. Oversize uses the old path. */
+                if (bytes > 2147483647) return NULL;
+            }
+        }
+        return PyUnicode_AsUTF8AndSize(text, length);
+    }
+    """
+    const char* rmcp_utf8_document_view(object text, Py_ssize_t* length) except? NULL
 
 cdef extern from *:
     r"""
@@ -486,6 +510,42 @@ cdef class Tokenizer:
         cdef int has_special = 0
         cdef bint in_ws = string[0].isspace()
         cdef str span
+        cdef const char* utf8 = NULL
+        cdef Py_ssize_t utf8_length = 0
+        cdef Py_ssize_t byte_i = 0
+        cdef Py_ssize_t byte_start = 0
+        cdef Py_UCS4 point
+        if type(self) is Tokenizer and type(string) is str:
+            utf8 = rmcp_utf8_document_view(string, &utf8_length)
+        if utf8 != NULL:
+            for point in string:
+                if Py_UNICODE_ISSPACE(point) != in_ws:
+                    if start < i:
+                        key = hash_utf8(<char*>(utf8 + byte_start), byte_i - byte_start)
+                        if key == 0:
+                            key = hash_string(string[start:i])
+                        if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                            span = string[start:i]
+                            self._tokenize(doc, span, key, &has_special, with_special_cases)
+                    if point == 32:
+                        doc.c[doc.length - 1].spacy = True
+                        start = i + 1
+                        byte_start = byte_i + 1
+                    else:
+                        start = i
+                        byte_start = byte_i
+                    in_ws = not in_ws
+                byte_i += 1 + (point >= 0x80) + (point >= 0x800) + (point >= 0x10000)
+                i += 1
+            if start < i:
+                key = hash_utf8(<char*>(utf8 + byte_start), byte_i - byte_start)
+                if key == 0:
+                    key = hash_string(string[start:])
+                if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                    span = string[start:]
+                    self._tokenize(doc, span, key, &has_special, with_special_cases)
+                doc.c[doc.length - 1].spacy = string[-1] == " " and not in_ws
+            return doc
         # The task here is much like string.split, but not quite
         # We find spans of whitespace and non-space characters, and ignore
         # spans that are exactly ' '. So, our sequences will all be separated
