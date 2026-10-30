@@ -3,13 +3,13 @@ cimport cython
 from cymem.cymem cimport Pool
 from cython.operator cimport dereference as deref
 from cython.operator cimport preincrement as preinc
-from libc.string cimport memcpy, memset
+from libc.string cimport memmove, memcpy, memset
 from libcpp.set cimport set as stdset
 from preshed.maps cimport PreshMap
 
 import re
 from .lexeme cimport EMPTY_LEXEME
-from .strings cimport hash_string
+from .strings cimport hash_string, hash_utf8
 from .tokens.doc cimport Doc
 
 from . import util
@@ -26,6 +26,31 @@ from re import Pattern as _RegexPattern
 
 cdef extern from *:
     r"""
+    // A borrowed byte range for ASCII spans in every Unicode storage width.
+    // No Python objects/callbacks are created here. Long or non-ASCII spans use
+    // the original slice/UTF-8 path. Tokenizer class/PXD layout is unchanged.
+    static int rmcp_copy_ascii_span(PyObject *text, Py_ssize_t start,
+                                   Py_ssize_t length, char *scratch,
+                                   const char **address) {
+        if (!PyUnicode_CheckExact(text) || length > 256) return 0;
+        int kind = PyUnicode_KIND(text);
+        void *data = PyUnicode_DATA(text);
+        if (kind == PyUnicode_1BYTE_KIND) {
+            const unsigned char *at = PyUnicode_1BYTE_DATA(text) + start;
+            for (Py_ssize_t i = 0; i < length; ++i) {
+                if (at[i] >= 128) return 0;
+            }
+            *address = (const char *)at;
+        } else {
+            for (Py_ssize_t i = 0; i < length; ++i) {
+                Py_UCS4 value = PyUnicode_READ(kind, data, start + i);
+                if (value >= 128) return 0;
+                scratch[i] = (char)value;
+            }
+            *address = scratch;
+        }
+        return 1;
+    }
     static PyCFunction rmcp_ascii_regex_match_function = NULL;
     static void rmcp_set_ascii_regex_match_function(PyObject *callback) {
         rmcp_ascii_regex_match_function = PyCFunction_GET_FUNCTION(callback);
@@ -62,6 +87,8 @@ cdef extern from *:
         return value == 32;
     }
     """
+    bint rmcp_copy_ascii_span(object text, Py_ssize_t start, Py_ssize_t length,
+                              char* scratch, const char** address)
     void rmcp_set_ascii_regex_match_function(object callback)
     bint rmcp_ascii_word_text(object text)
     int rmcp_exact_ascii_pattern(object callback, object pattern_type) except -1
@@ -486,6 +513,8 @@ cdef class Tokenizer:
         cdef int has_special = 0
         cdef bint in_ws = string[0].isspace()
         cdef str span
+        cdef char rmcp_scratch[256]
+        cdef const char* rmcp_address
         # The task here is much like string.split, but not quite
         # We find spans of whitespace and non-space characters, and ignore
         # spans that are exactly ' '. So, our sequences will all be separated
@@ -497,10 +526,20 @@ cdef class Tokenizer:
                     # with PyUnicode_AS_DATA, and then maintain a start_byte
                     # and end_byte, so we can call hash64 directly. That way
                     # we don't have to create the slice when we hit the cache.
-                    span = string[start:i]
-                    key = hash_string(span)
-                    if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
-                        self._tokenize(doc, span, key, &has_special, with_special_cases)
+                    if rmcp_copy_ascii_span(string, start, i - start, rmcp_scratch, &rmcp_address):
+                        key = hash_utf8(<char*>rmcp_address, i - start)
+                        if key == 0:
+                            # Keep the original cpdef except-0 behavior.
+                            span = string[start:i]
+                            key = hash_string(span)
+                        if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                            span = string[start:i]
+                            self._tokenize(doc, span, key, &has_special, with_special_cases)
+                    else:
+                        span = string[start:i]
+                        key = hash_string(span)
+                        if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                            self._tokenize(doc, span, key, &has_special, with_special_cases)
                 if uc == ' ':
                     doc.c[doc.length - 1].spacy = True
                     start = i + 1
@@ -509,10 +548,19 @@ cdef class Tokenizer:
                 in_ws = not in_ws
             i += 1
         if start < i:
-            span = string[start:]
-            key = hash_string(span)
-            if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
-                self._tokenize(doc, span, key, &has_special, with_special_cases)
+            if rmcp_copy_ascii_span(string, start, i - start, rmcp_scratch, &rmcp_address):
+                key = hash_utf8(<char*>rmcp_address, i - start)
+                if key == 0:
+                    span = string[start:]
+                    key = hash_string(span)
+                if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                    span = string[start:]
+                    self._tokenize(doc, span, key, &has_special, with_special_cases)
+            else:
+                span = string[start:]
+                key = hash_string(span)
+                if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                    self._tokenize(doc, span, key, &has_special, with_special_cases)
             doc.c[doc.length - 1].spacy = string[-1] == " " and not in_ws
         return doc
 
@@ -637,35 +685,69 @@ cdef class Tokenizer:
         cdef int orig_idx
         cdef int span_start
         cdef int span_end
-        while i < doc.length:
-            if i not in span_data:
-                tokens[i + offset] = doc.c[i]
-                i += 1
-            else:
-                span = span_data[i]
-                span_start = span[1]
-                span_end = span[2]
-                cached = <_Cached*>self._specials.get(hash_string(span[0]))
-                if cached == NULL:
-                    # Copy original tokens if no rule found
-                    for j in range(span_end - span_start):
-                        tokens[i + offset + j] = doc.c[i + j]
-                    i += span_end - span_start
+        if type(self) is not Tokenizer:
+            while i < doc.length:
+                if i not in span_data:
+                    tokens[i + offset] = doc.c[i]
+                    i += 1
                 else:
-                    # Copy special case tokens into doc and adjust token and
-                    # character offsets
-                    idx_offset = 0
-                    orig_final_spacy = doc.c[span_end - 1].spacy
-                    orig_idx = doc.c[i].idx
-                    for j in range(cached.length):
-                        tokens[i + offset + j] = cached.data.tokens[j]
-                        tokens[i + offset + j].idx = orig_idx + idx_offset
-                        idx_offset += cached.data.tokens[j].lex.length
-                        if cached.data.tokens[j].spacy:
-                            idx_offset += 1
-                    tokens[i + offset + cached.length - 1].spacy = orig_final_spacy
-                    i += span_end - span_start
-                    offset += span[3]
+                    span = span_data[i]
+                    span_start = span[1]
+                    span_end = span[2]
+                    cached = <_Cached*>self._specials.get(hash_string(span[0]))
+                    if cached == NULL:
+                        # Copy original tokens if no rule found
+                        for j in range(span_end - span_start):
+                            tokens[i + offset + j] = doc.c[i + j]
+                        i += span_end - span_start
+                    else:
+                        # Copy special case tokens into doc and adjust token and
+                        # character offsets
+                        idx_offset = 0
+                        orig_final_spacy = doc.c[span_end - 1].spacy
+                        orig_idx = doc.c[i].idx
+                        for j in range(cached.length):
+                            tokens[i + offset + j] = cached.data.tokens[j]
+                            tokens[i + offset + j].idx = orig_idx + idx_offset
+                            idx_offset += cached.data.tokens[j].lex.length
+                            if cached.data.tokens[j].spacy:
+                                idx_offset += 1
+                        tokens[i + offset + cached.length - 1].spacy = orig_final_spacy
+                        i += span_end - span_start
+                        offset += span[3]
+            return offset
+        # _prepare_special_spans inserts the filtered disjoint spans in start
+        # order. Copy each untouched gap once instead of boxing every token
+        # index for a dictionary membership lookup. memmove also handles the
+        # overlapping earlier destination when the document shrinks in place.
+        for span in span_data.values():
+            span_start = span[1]
+            span_end = span[2]
+            if span_start > i:
+                memmove(&tokens[i + offset], &doc.c[i],
+                        (span_start - i) * sizeof(TokenC))
+            i = span_start
+            cached = <_Cached*>self._specials.get(hash_string(span[0]))
+            if cached == NULL:
+                memmove(&tokens[i + offset], &doc.c[i],
+                        (span_end - span_start) * sizeof(TokenC))
+                i += span_end - span_start
+            else:
+                idx_offset = 0
+                orig_final_spacy = doc.c[span_end - 1].spacy
+                orig_idx = doc.c[i].idx
+                for j in range(cached.length):
+                    tokens[i + offset + j] = cached.data.tokens[j]
+                    tokens[i + offset + j].idx = orig_idx + idx_offset
+                    idx_offset += cached.data.tokens[j].lex.length
+                    if cached.data.tokens[j].spacy:
+                        idx_offset += 1
+                tokens[i + offset + cached.length - 1].spacy = orig_final_spacy
+                i += span_end - span_start
+                offset += span[3]
+        if i < doc.length:
+            memmove(&tokens[i + offset], &doc.c[i],
+                    (doc.length - i) * sizeof(TokenC))
         return offset
 
     cdef int _try_specials_and_cache(self, hash_t key, Doc tokens, int* has_special, bint with_special_cases) except -1:
