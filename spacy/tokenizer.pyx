@@ -1,3 +1,110 @@
+from libc.stdint cimport uint64_t
+
+
+cdef extern from *:
+    r"""
+    #include <stdint.h>
+    #if defined(__SSE2__)
+    #include <emmintrin.h>
+    #endif
+    static int rmcp_exact_unicode(PyObject *text) {
+        return PyUnicode_CheckExact(text);
+    }
+    static unsigned rmcp_first_set_bit(uint64_t value) {
+        #if defined(__GNUC__) || defined(__clang__)
+        return (unsigned)__builtin_ctzll(value);
+        #else
+        unsigned result = 0;
+        while (!(value & 1u)) { ++result; value >>= 1; }
+        return result;
+        #endif
+    }
+    #if defined(__SSE2__)
+    static __m128i rmcp_space8(__m128i c) {
+        __m128i a = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(8)),
+                                 _mm_cmpgt_epi8(_mm_set1_epi8(14), c));
+        __m128i b = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(27)),
+                                 _mm_cmpgt_epi8(_mm_set1_epi8(33), c));
+        __m128i d = _mm_or_si128(_mm_cmpeq_epi8(c, _mm_set1_epi8((char)0x85)),
+                                _mm_cmpeq_epi8(c, _mm_set1_epi8((char)0xa0)));
+        return _mm_or_si128(_mm_or_si128(a, b), d);
+    }
+    static __m128i rmcp_space16(__m128i c) {
+        __m128i a = _mm_and_si128(_mm_cmpgt_epi16(c, _mm_set1_epi16(8)),
+                                 _mm_cmpgt_epi16(_mm_set1_epi16(14), c));
+        __m128i b = _mm_and_si128(_mm_cmpgt_epi16(c, _mm_set1_epi16(27)),
+                                 _mm_cmpgt_epi16(_mm_set1_epi16(33), c));
+        __m128i d = _mm_or_si128(_mm_cmpeq_epi16(c, _mm_set1_epi16(0x85)),
+                                _mm_cmpeq_epi16(c, _mm_set1_epi16(0xa0)));
+        __m128i e = _mm_or_si128(_mm_cmpeq_epi16(c, _mm_set1_epi16(0x1680)),
+                                _mm_cmpeq_epi16(c, _mm_set1_epi16(0x202f)));
+        __m128i f = _mm_or_si128(_mm_cmpeq_epi16(c, _mm_set1_epi16(0x205f)),
+                                _mm_cmpeq_epi16(c, _mm_set1_epi16(0x3000)));
+        __m128i g = _mm_and_si128(_mm_cmpgt_epi16(c, _mm_set1_epi16(0x1fff)),
+                                 _mm_cmpgt_epi16(_mm_set1_epi16(0x200b), c));
+        __m128i h = _mm_cmpeq_epi16(_mm_and_si128(c, _mm_set1_epi16((short)~1)),
+                                   _mm_set1_epi16(0x2028));
+        return _mm_or_si128(_mm_or_si128(_mm_or_si128(a, b), _mm_or_si128(d, e)),
+                            _mm_or_si128(_mm_or_si128(f, g), h));
+    }
+    static __m128i rmcp_space32(__m128i c) {
+        __m128i a = _mm_and_si128(_mm_cmpgt_epi32(c, _mm_set1_epi32(8)),
+                                 _mm_cmpgt_epi32(_mm_set1_epi32(14), c));
+        __m128i b = _mm_and_si128(_mm_cmpgt_epi32(c, _mm_set1_epi32(27)),
+                                 _mm_cmpgt_epi32(_mm_set1_epi32(33), c));
+        __m128i d = _mm_or_si128(_mm_cmpeq_epi32(c, _mm_set1_epi32(0x85)),
+                                _mm_cmpeq_epi32(c, _mm_set1_epi32(0xa0)));
+        __m128i e = _mm_or_si128(_mm_cmpeq_epi32(c, _mm_set1_epi32(0x1680)),
+                                _mm_cmpeq_epi32(c, _mm_set1_epi32(0x202f)));
+        __m128i f = _mm_or_si128(_mm_cmpeq_epi32(c, _mm_set1_epi32(0x205f)),
+                                _mm_cmpeq_epi32(c, _mm_set1_epi32(0x3000)));
+        __m128i g = _mm_and_si128(_mm_cmpgt_epi32(c, _mm_set1_epi32(0x1fff)),
+                                 _mm_cmpgt_epi32(_mm_set1_epi32(0x200b), c));
+        __m128i h = _mm_cmpeq_epi32(_mm_and_si128(c, _mm_set1_epi32(~1)),
+                                   _mm_set1_epi32(0x2028));
+        return _mm_or_si128(_mm_or_si128(_mm_or_si128(a, b), _mm_or_si128(d, e)),
+                            _mm_or_si128(_mm_or_si128(f, g), h));
+    }
+    #endif
+    static uint64_t rmcp_space_transition_block(PyObject *text, Py_ssize_t start,
+                                                unsigned width, int previous_space) {
+        const int kind = PyUnicode_KIND(text);
+        const void *data = PyUnicode_DATA(text);
+        uint64_t spaces = 0;
+        unsigned pos = 0;
+        #if defined(__SSE2__)
+        const unsigned lanes = 16 / kind;
+        while (width - pos >= lanes) {
+            const unsigned char *bytes = (const unsigned char *)data + (start + pos) * kind;
+            const __m128i c = _mm_loadu_si128((const __m128i *)bytes);
+            const __m128i matches = kind == 1 ? rmcp_space8(c) : kind == 2 ? rmcp_space16(c) : rmcp_space32(c);
+            unsigned bits;
+            if (kind == 4) {
+                bits = (unsigned)_mm_movemask_ps(_mm_castsi128_ps(matches));
+            } else {
+                bits = (unsigned)_mm_movemask_epi8(matches);
+                if (kind == 2) {
+                    bits &= 0x5555u;
+                    bits = (bits | (bits >> 1)) & 0x3333u;
+                    bits = (bits | (bits >> 2)) & 0x0f0fu;
+                    bits = (bits | (bits >> 4)) & 0x00ffu;
+                }
+            }
+            spaces |= (uint64_t)bits << pos;
+            pos += lanes;
+        }
+        #endif
+        for (; pos < width; ++pos) {
+            spaces |= (uint64_t)!!Py_UNICODE_ISSPACE(PyUnicode_READ(kind, data, start + pos)) << pos;
+        }
+        const uint64_t valid = width == 64 ? UINT64_MAX : (((uint64_t)1 << width) - 1);
+        return (spaces ^ ((spaces << 1) | (uint64_t)previous_space)) & valid;
+    }
+    """
+    bint rmcp_exact_unicode(object text)
+    unsigned rmcp_first_set_bit(uint64_t value)
+    uint64_t rmcp_space_transition_block(object text, Py_ssize_t start, unsigned width, int previous_space)
+
 # cython: embedsignature=True, binding=True
 cimport cython
 from cymem.cymem cimport Pool
@@ -322,6 +429,73 @@ cdef inline bint _rmcp_has_default_suffix_search(RMCPSuffixSearch owner) except 
     # must release it before invoking an arbitrary callback/Match-like result.
     return rmcp_exact_default_suffix(owner._search, _RegexPattern, owner._rmcp_english_pattern)
 
+from weakref import ref as _rmcp_prefix_weakref
+
+cdef str _rmcp_english_prefix_pattern = '^§|^%|^=|^—|^–|^\\+(?![0-9])|^…|^……|^,|^:|^;|^\\!|^\\?|^¿|^؟|^¡|^\\(|^\\)|^\\[|^\\]|^\\{|^\\}|^<|^>|^_|^#|^\\*|^&|^。|^？|^！|^，|^、|^；|^：|^～|^·|^।|^،|^۔|^؛|^٪|^\\.\\.+|^…|^\\\'|^"|^”|^“|^`|^‘|^´|^’|^‚|^,|^„|^»|^«|^「|^」|^『|^』|^（|^）|^〔|^〕|^【|^】|^《|^》|^〈|^〉|^〈|^〉|^⟦|^⟧|^\\$|^£|^€|^¥|^฿|^US\\$|^C\\$|^A\\$|^₽|^﷼|^₴|^₠|^₡|^₢|^₣|^₤|^₥|^₦|^₧|^₨|^₩|^₪|^₫|^€|^₭|^₮|^₯|^₰|^₱|^₲|^₳|^₴|^₵|^₶|^₷|^₸|^₹|^₺|^₻|^₼|^₽|^₾|^₿|^[\\u00A6\\u00A9\\u00AE\\u00B0\\u0482\\u058D\\u058E\\u060E\\u060F\\u06DE\\u06E9\\u06FD\\u06FE\\u07F6\\u09FA\\u0B70\\u0BF3-\\u0BF8\\u0BFA\\u0C7F\\u0D4F\\u0D79\\u0F01-\\u0F03\\u0F13\\u0F15-\\u0F17\\u0F1A-\\u0F1F\\u0F34\\u0F36\\u0F38\\u0FBE-\\u0FC5\\u0FC7-\\u0FCC\\u0FCE\\u0FCF\\u0FD5-\\u0FD8\\u109E\\u109F\\u1390-\\u1399\\u1940\\u19DE-\\u19FF\\u1B61-\\u1B6A\\u1B74-\\u1B7C\\u2100\\u2101\\u2103-\\u2106\\u2108\\u2109\\u2114\\u2116\\u2117\\u211E-\\u2123\\u2125\\u2127\\u2129\\u212E\\u213A\\u213B\\u214A\\u214C\\u214D\\u214F\\u218A\\u218B\\u2195-\\u2199\\u219C-\\u219F\\u21A1\\u21A2\\u21A4\\u21A5\\u21A7-\\u21AD\\u21AF-\\u21CD\\u21D0\\u21D1\\u21D3\\u21D5-\\u21F3\\u2300-\\u2307\\u230C-\\u231F\\u2322-\\u2328\\u232B-\\u237B\\u237D-\\u239A\\u23B4-\\u23DB\\u23E2-\\u2426\\u2440-\\u244A\\u249C-\\u24E9\\u2500-\\u25B6\\u25B8-\\u25C0\\u25C2-\\u25F7\\u2600-\\u266E\\u2670-\\u2767\\u2794-\\u27BF\\u2800-\\u28FF\\u2B00-\\u2B2F\\u2B45\\u2B46\\u2B4D-\\u2B73\\u2B76-\\u2B95\\u2B98-\\u2BC8\\u2BCA-\\u2BFE\\u2CE5-\\u2CEA\\u2E80-\\u2E99\\u2E9B-\\u2EF3\\u2F00-\\u2FD5\\u2FF0-\\u2FFB\\u3004\\u3012\\u3013\\u3020\\u3036\\u3037\\u303E\\u303F\\u3190\\u3191\\u3196-\\u319F\\u31C0-\\u31E3\\u3200-\\u321E\\u322A-\\u3247\\u3250\\u3260-\\u327F\\u328A-\\u32B0\\u32C0-\\u32FE\\u3300-\\u33FF\\u4DC0-\\u4DFF\\uA490-\\uA4C6\\uA828-\\uA82B\\uA836\\uA837\\uA839\\uAA77-\\uAA79\\uFDFD\\uFFE4\\uFFE8\\uFFED\\uFFEE\\uFFFC\\uFFFD\\U00010137-\\U0001013F\\U00010179-\\U00010189\\U0001018C-\\U0001018E\\U00010190-\\U0001019B\\U000101A0\\U000101D0-\\U000101FC\\U00010877\\U00010878\\U00010AC8\\U0001173F\\U00016B3C-\\U00016B3F\\U00016B45\\U0001BC9C\\U0001D000-\\U0001D0F5\\U0001D100-\\U0001D126\\U0001D129-\\U0001D164\\U0001D16A-\\U0001D16C\\U0001D183\\U0001D184\\U0001D18C-\\U0001D1A9\\U0001D1AE-\\U0001D1E8\\U0001D200-\\U0001D241\\U0001D245\\U0001D300-\\U0001D356\\U0001D800-\\U0001D9FF\\U0001DA37-\\U0001DA3A\\U0001DA6D-\\U0001DA74\\U0001DA76-\\U0001DA83\\U0001DA85\\U0001DA86\\U0001ECAC\\U0001F000-\\U0001F02B\\U0001F030-\\U0001F093\\U0001F0A0-\\U0001F0AE\\U0001F0B1-\\U0001F0BF\\U0001F0C1-\\U0001F0CF\\U0001F0D1-\\U0001F0F5\\U0001F110-\\U0001F16B\\U0001F170-\\U0001F1AC\\U0001F1E6-\\U0001F202\\U0001F210-\\U0001F23B\\U0001F240-\\U0001F248\\U0001F250\\U0001F251\\U0001F260-\\U0001F265\\U0001F300-\\U0001F3FA\\U0001F400-\\U0001F6D4\\U0001F6E0-\\U0001F6EC\\U0001F6F0-\\U0001F6F9\\U0001F700-\\U0001F773\\U0001F780-\\U0001F7D8\\U0001F800-\\U0001F80B\\U0001F810-\\U0001F847\\U0001F850-\\U0001F859\\U0001F860-\\U0001F887\\U0001F890-\\U0001F8AD\\U0001F900-\\U0001F90B\\U0001F910-\\U0001F93E\\U0001F940-\\U0001F970\\U0001F973-\\U0001F976\\U0001F97A\\U0001F97C-\\U0001F9A2\\U0001F9B0-\\U0001F9B9\\U0001F9C0-\\U0001F9C2\\U0001F9D0-\\U0001F9FF\\U0001FA60-\\U0001FA6D]'
+cdef object _rmcp_prefix_pattern_ref = None
+
+cdef extern from *:
+    r"""
+    static PyCFunction rmcp_prefix_regex_search_function = NULL;
+    static void rmcp_set_prefix_regex_search_function(PyObject *callback) {
+        rmcp_prefix_regex_search_function = PyCFunction_GET_FUNCTION(callback);
+    }
+    static int rmcp_exact_english_prefix(PyObject *callback, PyObject *pattern_type,
+                                         PyObject *expected_pattern) {
+        if (!PyCFunction_Check(callback) ||
+            PyCFunction_GET_FUNCTION(callback) != rmcp_prefix_regex_search_function)
+            return 0;
+        PyObject *owner = PyCFunction_GET_SELF(callback);
+        if (owner == NULL || !Py_IS_TYPE(owner, (PyTypeObject *)pattern_type)) return 0;
+        PyObject *pattern = PyObject_GetAttrString(owner, "pattern");
+        if (pattern == NULL) return -1;
+        int equal = PyUnicode_CheckExact(pattern) &&
+            PyUnicode_Compare(pattern, expected_pattern) == 0;
+        Py_DECREF(pattern);
+        if (!equal) return 0;
+        PyObject *flags = PyObject_GetAttrString(owner, "flags");
+        if (flags == NULL) return -1;
+        long value = PyLong_AsLong(flags);
+        Py_DECREF(flags);
+        if (value == -1 && PyErr_Occurred()) return -1;
+        return value == 32;
+    }
+    static const unsigned char rmcp_prefix_ascii[128] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,0};
+    static const unsigned int rmcp_prefix_ranges[][2] = {{161,161},{163,163},{165,167},{169,169},{171,171},{174,174},{176,176},{180,180},{183,183},{187,187},{191,191},{1154,1154},{1421,1422},{1548,1548},{1550,1551},{1563,1563},{1567,1567},{1642,1642},{1748,1748},{1758,1758},{1769,1769},{1789,1790},{2038,2038},{2404,2404},{2554,2554},{2928,2928},{3059,3064},{3066,3066},{3199,3199},{3407,3407},{3449,3449},{3647,3647},{3841,3843},{3859,3859},{3861,3863},{3866,3871},{3892,3892},{3894,3894},{3896,3896},{4030,4037},{4039,4044},{4046,4047},{4053,4056},{4254,4255},{5008,5017},{6464,6464},{6622,6655},{7009,7018},{7028,7036},{8211,8212},{8216,8218},{8220,8222},{8230,8230},{8352,8383},{8448,8449},{8451,8454},{8456,8457},{8468,8468},{8470,8471},{8478,8483},{8485,8485},{8487,8487},{8489,8489},{8494,8494},{8506,8507},{8522,8522},{8524,8525},{8527,8527},{8586,8587},{8597,8601},{8604,8607},{8609,8610},{8612,8613},{8615,8621},{8623,8653},{8656,8657},{8659,8659},{8661,8691},{8960,8967},{8972,8991},{8994,9083},{9085,9114},{9140,9179},{9186,9254},{9280,9290},{9372,9449},{9472,9654},{9656,9664},{9666,9719},{9728,9838},{9840,10087},{10132,10175},{10214,10215},{10240,10495},{11008,11055},{11077,11078},{11085,11123},{11126,11157},{11160,11208},{11210,11262},{11493,11498},{11904,11929},{11931,12019},{12032,12245},{12272,12283},{12289,12290},{12292,12292},{12296,12309},{12320,12320},{12342,12343},{12350,12351},{12688,12689},{12694,12703},{12736,12771},{12800,12830},{12842,12871},{12880,12880},{12896,12927},{12938,12976},{12992,13054},{13056,13311},{19904,19967},{42128,42182},{43048,43051},{43062,43063},{43065,43065},{43639,43641},{65020,65021},{65281,65281},{65288,65289},{65292,65292},{65306,65307},{65311,65311},{65374,65374},{65508,65508},{65512,65512},{65517,65518},{65532,65533},{65847,65855},{65913,65929},{65932,65934},{65936,65947},{65952,65952},{66000,66044},{67703,67704},{68296,68296},{71487,71487},{92988,92991},{92997,92997},{113820,113820},{118784,119029},{119040,119078},{119081,119140},{119146,119148},{119171,119172},{119180,119209},{119214,119272},{119296,119361},{119365,119365},{119552,119638},{120832,121343},{121399,121402},{121453,121460},{121462,121475},{121477,121478},{126124,126124},{126976,127019},{127024,127123},{127136,127150},{127153,127167},{127169,127183},{127185,127221},{127248,127339},{127344,127404},{127462,127490},{127504,127547},{127552,127560},{127568,127569},{127584,127589},{127744,127994},{128000,128724},{128736,128748},{128752,128761},{128768,128883},{128896,128984},{129024,129035},{129040,129095},{129104,129113},{129120,129159},{129168,129197},{129280,129291},{129296,129342},{129344,129392},{129395,129398},{129402,129402},{129404,129442},{129456,129465},{129472,129474},{129488,129535},{129632,129645}};
+    static Py_ssize_t rmcp_known_prefix_length(PyObject *text, PyObject *callback, PyObject *reference) {
+        if (!PyUnicode_CheckExact(text) || reference == Py_None || !PyCFunction_Check(callback) ||
+            PyCFunction_GET_FUNCTION(callback) != rmcp_prefix_regex_search_function) return -1;
+        PyObject *pattern = PyWeakref_GetObject(reference);
+        if (pattern == Py_None || PyCFunction_GET_SELF(callback) != pattern) return -1;
+        Py_ssize_t n = PyUnicode_GET_LENGTH(text);
+        if (n == 0) return 0;
+        Py_UCS4 c = PyUnicode_READ_CHAR(text, 0);
+        if (c == '.') {
+            if (n < 2 || PyUnicode_READ_CHAR(text, 1) != '.') return 0;
+            Py_ssize_t end = 2;
+            while (end < n && PyUnicode_READ_CHAR(text, end) == '.') ++end;
+            return end;
+        }
+        if (c == '+') return (n > 1 && PyUnicode_READ_CHAR(text, 1) >= '0' && PyUnicode_READ_CHAR(text, 1) <= '9') ? 0 : 1;
+        if (c == 'A' || c == 'C') return (n > 1 && PyUnicode_READ_CHAR(text, 1) == '$') ? 2 : 0;
+        if (c == 'U') return (n > 2 && PyUnicode_READ_CHAR(text, 1) == 'S' && PyUnicode_READ_CHAR(text, 2) == '$') ? 3 : 0;
+        if (c < 128) return rmcp_prefix_ascii[c];
+        size_t lo = 0, hi = sizeof(rmcp_prefix_ranges)/sizeof(rmcp_prefix_ranges[0]);
+        while (lo < hi) {
+            size_t mid = lo + (hi-lo)/2;
+            if (c < rmcp_prefix_ranges[mid][0]) hi=mid;
+            else if (c > rmcp_prefix_ranges[mid][1]) lo=mid+1;
+            else return 1;
+        }
+        return 0;
+    }
+    """
+    void rmcp_set_prefix_regex_search_function(object callback)
+    int rmcp_exact_english_prefix(object callback, object pattern_type, object expected_pattern) except -1
+    Py_ssize_t rmcp_known_prefix_length(object text, object callback, object reference)
+
+rmcp_set_prefix_regex_search_function(re.compile('').search)
+
 cdef class Tokenizer:
     """Segment text, and create Doc objects with the discovered segment
     boundaries.
@@ -403,7 +577,12 @@ cdef class Tokenizer:
 
     @prefix_search.setter
     def prefix_search(self, prefix_search):
+        global _rmcp_prefix_pattern_ref
         self._prefix_search = prefix_search
+        # Classification reads only exact immutable builtin Pattern fields.
+        # No Tokenizer layout field or strong callback/Pattern reference is added.
+        if type(self) is Tokenizer and rmcp_exact_english_prefix(self._prefix_search, _RegexPattern, _rmcp_english_prefix_pattern):
+            _rmcp_prefix_pattern_ref = _rmcp_prefix_weakref(self._prefix_search.__self__)
         self._reload_special_cases()
 
     @property
@@ -486,6 +665,39 @@ cdef class Tokenizer:
         cdef int has_special = 0
         cdef bint in_ws = string[0].isspace()
         cdef str span
+        cdef int block_start = 1
+        cdef unsigned block_width
+        cdef uint64_t transitions
+        if rmcp_exact_unicode(string):
+            # Each character is classified once. Consume every transition in
+            # the block, including runs crossing its boundary, before loading
+            # the next block. The original subclass loop remains below.
+            while block_start < length:
+                block_width = 64 if length - block_start >= 64 else length - block_start
+                transitions = rmcp_space_transition_block(string, block_start, block_width, in_ws)
+                while transitions:
+                    i = block_start + rmcp_first_set_bit(transitions)
+                    transitions &= transitions - 1
+                    if start < i:
+                        span = string[start:i]
+                        key = hash_string(span)
+                        if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                            self._tokenize(doc, span, key, &has_special, with_special_cases)
+                    if string[i] == ' ':
+                        doc.c[doc.length - 1].spacy = True
+                        start = i + 1
+                    else:
+                        start = i
+                    in_ws = not in_ws
+                block_start += block_width
+            i = length
+            if start < i:
+                span = string[start:]
+                key = hash_string(span)
+                if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                    self._tokenize(doc, span, key, &has_special, with_special_cases)
+                doc.c[doc.length - 1].spacy = string[-1] == " " and not in_ws
+            return doc
         # The task here is much like string.split, but not quite
         # We find spans of whitespace and non-space characters, and ignore
         # spans that are exactly ' '. So, our sequences will all be separated
@@ -706,7 +918,9 @@ cdef class Tokenizer:
                                    has_special, with_special_cases)
         self._attach_tokens(tokens, span, &prefixes, &suffixes, has_special,
                             with_special_cases)
-        if len(self._cache) < self.max_cache_size:
+        # Exact base instances cannot save while the document's special flag is set.
+        # Keep the original call path for native subclasses overriding _save_cached.
+        if (type(self) is not Tokenizer or type(self.vocab) is not Vocab or not has_special[0]) and len(self._cache) < self.max_cache_size:
             self._save_cached(&tokens.c[orig_size], orig_key, has_special,
                               tokens.length - orig_size)
 
@@ -861,6 +1075,11 @@ cdef class Tokenizer:
 
         DOCS: https://spacy.io/api/tokenizer#find_prefix
         """
+        cdef Py_ssize_t native_prefix
+        if type(self) is Tokenizer:
+            native_prefix = rmcp_known_prefix_length(string, self._prefix_search, _rmcp_prefix_pattern_ref)
+            if native_prefix >= 0:
+                return native_prefix
         if self.prefix_search is None:
             return 0
         match = self.prefix_search(string)
