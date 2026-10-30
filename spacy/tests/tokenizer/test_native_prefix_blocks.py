@@ -110,9 +110,12 @@ def test_prefix_callback_guard_never_calls_rich_equality():
             raise AssertionError("prefix guards must compare identity")
 
     tokenizer = English().tokenizer
+    # Keep the classified callback alive while checking its replacement.
+    original = tokenizer.prefix_search
     tokenizer.prefix_search = Callback()
     assert tokenizer.find_prefix("abc") == 1
     assert tokenizer.find_prefix("..abc") == 0
+    assert original is not tokenizer.prefix_search
 
 
 class ReferenceTokenizer(Tokenizer):
