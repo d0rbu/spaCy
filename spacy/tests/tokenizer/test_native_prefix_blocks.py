@@ -77,6 +77,44 @@ def test_prefix_cache_does_not_retain_pattern():
     assert reference() is None
 
 
+def test_prefix_callback_identity_preserves_interleaved_tokenizers():
+    first = English().tokenizer
+    second = English().tokenizer
+    first_search = first.prefix_search
+    second_search = second.prefix_search
+    assert first_search is not second_search
+    first_reference = weakref.ref(first_search)
+    second_reference = weakref.ref(second_search)
+    for text in ("word", "US$10", "..word", "+12", "+word", "🙂x", "中x"):
+        assert first.find_prefix(text) == prefix_length(first_search, text)
+        assert second.find_prefix(text) == prefix_length(second_search, text)
+    first.prefix_search = None
+    del first_search
+    gc.collect()
+    assert first_reference() is None
+    assert first.find_prefix("US$10") == 0
+    assert second.find_prefix("US$10") == 3
+    second.prefix_search = None
+    del second_search
+    gc.collect()
+    assert second_reference() is None
+    assert second.find_prefix("US$10") == 0
+
+
+def test_prefix_callback_guard_never_calls_rich_equality():
+    class Callback:
+        def __call__(self, text):
+            return re.match("^a", text)
+
+        def __eq__(self, other):
+            raise AssertionError("prefix guards must compare identity")
+
+    tokenizer = English().tokenizer
+    tokenizer.prefix_search = Callback()
+    assert tokenizer.find_prefix("abc") == 1
+    assert tokenizer.find_prefix("..abc") == 0
+
+
 class ReferenceTokenizer(Tokenizer):
     """A subclass keeps the callback-based tokenizer path."""
 
