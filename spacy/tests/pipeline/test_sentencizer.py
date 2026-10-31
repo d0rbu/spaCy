@@ -1,9 +1,62 @@
+import re
+
+import numpy as np
 import pytest
 
 import spacy
 from spacy.lang.en import English
 from spacy.pipeline import Sentencizer
+from spacy.pipeline.sentencizer import rmcp_sentence_offsets, rmcp_sentence_starts
 from spacy.tokens import Doc
+
+
+@pytest.mark.parametrize(
+    "text", ["", " ", "One. Next!", "\nA.\u2003 B?\n", "中。\u0085Next", "A!\U0001f642 B."]
+)
+@pytest.mark.parametrize("short_text", [False, True])
+def test_native_sentence_offsets_match_spans(text, short_text):
+    nlp = English()
+    nlp.add_pipe("sentencizer")
+    doc = nlp(text)
+    original = doc.to_array(["ORTH", "SENT_START"])
+    if short_text:
+        text = text[: len(text) // 2]
+    pattern = re.compile(r"\S")
+    expected = [
+        match.start()
+        for span in doc.sents
+        if (match := pattern.search(text, span.start_char, span.end_char)) is not None
+    ]
+    assert rmcp_sentence_offsets(doc, text) == expected
+    assert np.array_equal(original, doc.to_array(["ORTH", "SENT_START"]))
+
+
+def test_native_sentence_offsets_preserve_missing_annotation_error(en_vocab):
+    doc = Doc(en_vocab, words=["One", "Next"])
+    with pytest.raises(ValueError, match="E030"):
+        rmcp_sentence_offsets(doc, doc.text)
+
+
+@pytest.mark.parametrize("punct_count", [0, 1, 2, 128, 256])
+@pytest.mark.parametrize("words", [[], ["a"], ["a", ".", ")", "b", "!", "中", " "]])
+def test_native_sentence_state_matches_public_predictions(en_vocab, punct_count, words):
+    punctuation = {".", "a"}
+    punctuation = set(sorted(punctuation)[:punct_count])
+    punctuation.update(f"mark-{i}" for i in range(punct_count - len(punctuation)))
+    component = Sentencizer()
+    component.punct_chars = punctuation
+    doc = Doc(en_vocab, words=words)
+    before = doc.to_array(["ORTH", "IS_PUNCT", "SENT_START"])
+    endings = np.asarray([doc.vocab.strings[p] for p in punctuation], dtype=np.uint64)
+    assert rmcp_sentence_starts(doc, endings).tolist() == component.predict([doc])[0]
+    np.testing.assert_array_equal(
+        before, doc.to_array(["ORTH", "IS_PUNCT", "SENT_START"])
+    )
+
+
+def test_native_sentence_state_rejects_unbounded_punctuation(en_vocab):
+    with pytest.raises(ValueError, match="at most 256"):
+        rmcp_sentence_starts(Doc(en_vocab, words=["a"]), np.arange(257, dtype=np.uint64))
 
 
 def test_sentencizer(en_vocab):
