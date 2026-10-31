@@ -10,6 +10,10 @@ cdef extern from *:
     static int rmcp_exact_unicode(PyObject *text) {
         return PyUnicode_CheckExact(text);
     }
+    static char *rmcp_ascii_data(PyObject *text) {
+        if (!PyUnicode_CheckExact(text) || !PyUnicode_IS_ASCII(text)) return NULL;
+        return (char *)PyUnicode_1BYTE_DATA(text);
+    }
     static unsigned rmcp_first_set_bit(uint64_t value) {
         #if defined(__GNUC__) || defined(__clang__)
         return (unsigned)__builtin_ctzll(value);
@@ -102,6 +106,7 @@ cdef extern from *:
     }
     """
     bint rmcp_exact_unicode(object text)
+    char *rmcp_ascii_data(object text)
     unsigned rmcp_first_set_bit(uint64_t value)
     uint64_t rmcp_space_transition_block(object text, Py_ssize_t start, unsigned width, int previous_space)
 
@@ -116,7 +121,7 @@ from preshed.maps cimport PreshMap
 
 import re
 from .lexeme cimport EMPTY_LEXEME
-from .strings cimport hash_string
+from .strings cimport hash_string, hash_utf8
 from .tokens.doc cimport Doc
 
 from . import util
@@ -127,6 +132,10 @@ from .symbols import NORM, ORTH
 from .tokens import Span
 from .training import validate_examples
 from .util import get_words_and_spaces
+
+
+cdef inline hash_t _rmcp_hash_ascii_span(char *data, int start, int end) except 0:
+    return hash_utf8(data + start, end - start)
 
 
 from re import Pattern as _RegexPattern
@@ -667,6 +676,9 @@ cdef class Tokenizer:
         cdef int block_start = 1
         cdef unsigned block_width
         cdef uint64_t transitions
+        cdef char *ascii_data = NULL
+        if type(self) is Tokenizer and type(self.vocab) is Vocab:
+            ascii_data = rmcp_ascii_data(string)
         if rmcp_exact_unicode(string):
             # Each character is classified once. Consume every transition in
             # the block, including runs crossing its boundary, before loading
@@ -678,9 +690,14 @@ cdef class Tokenizer:
                     i = block_start + rmcp_first_set_bit(transitions)
                     transitions &= transitions - 1
                     if start < i:
-                        span = string[start:i]
-                        key = hash_string(span)
+                        if ascii_data != NULL:
+                            key = _rmcp_hash_ascii_span(ascii_data, start, i)
+                        else:
+                            span = string[start:i]
+                            key = hash_string(span)
                         if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                            if ascii_data != NULL:
+                                span = string[start:i]
                             self._tokenize(doc, span, key, &has_special, with_special_cases)
                     if string[i] == ' ':
                         doc.c[doc.length - 1].spacy = True
@@ -691,9 +708,14 @@ cdef class Tokenizer:
                 block_start += block_width
             i = length
             if start < i:
-                span = string[start:]
-                key = hash_string(span)
+                if ascii_data != NULL:
+                    key = _rmcp_hash_ascii_span(ascii_data, start, i)
+                else:
+                    span = string[start:]
+                    key = hash_string(span)
                 if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
+                    if ascii_data != NULL:
+                        span = string[start:]
                     self._tokenize(doc, span, key, &has_special, with_special_cases)
                 doc.c[doc.length - 1].spacy = string[-1] == " " and not in_ws
             return doc
