@@ -912,11 +912,24 @@ cdef class Tokenizer:
         cdef vector[LexemeC*] prefixes
         cdef vector[LexemeC*] suffixes
         cdef int orig_size
+        cdef const LexemeC* word_lexeme
         orig_size = tokens.length
-        span = self._split_affixes(tokens.mem, span, &prefixes, &suffixes,
-                                   has_special, with_special_cases)
-        self._attach_tokens(tokens, span, &prefixes, &suffixes, has_special,
-                            with_special_cases)
+        if type(self) is Tokenizer and type(self.vocab) is Vocab and self._rmcp_ascii_word_match and rmcp_ascii_word_text(span):
+            # The caller already missed specials/cache. This exact builtin word
+            # path breaks _split_affixes without a callback, then repeats the
+            # same hash/cache miss in _attach_tokens before appending this lexeme.
+            # orig_key already hashes this unchanged word. Existing vocabulary
+            # entries need no second StringStore hash or membership lookup.
+            # A missing/reserved-symbol key keeps the ordinary creation path.
+            word_lexeme = <const LexemeC*>self.vocab._by_orth.get(orig_key)
+            if word_lexeme == NULL:
+                word_lexeme = self.vocab.get(tokens.mem, span)
+            tokens.push_back(word_lexeme, False)
+        else:
+            span = self._split_affixes(tokens.mem, span, &prefixes, &suffixes,
+                                       has_special, with_special_cases)
+            self._attach_tokens(tokens, span, &prefixes, &suffixes, has_special,
+                                with_special_cases)
         # Exact base instances cannot save while the document's special flag is set.
         # Keep the original call path for native subclasses overriding _save_cached.
         if (type(self) is not Tokenizer or type(self.vocab) is not Vocab or not has_special[0]) and len(self._cache) < self.max_cache_size:
