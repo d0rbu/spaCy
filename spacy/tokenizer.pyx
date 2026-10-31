@@ -495,6 +495,17 @@ cdef extern from *:
 
 rmcp_set_prefix_regex_search_function(re.compile('').search)
 
+cdef inline _Cached* _rmcp_special_lookup(Tokenizer tokenizer, hash_t key) noexcept:
+    # A set bit is only a possible match: collisions still use the exact map.
+    # All public rule mutations update/reset these bits with the special table.
+    # Native subclasses keep the original lookup, including private map writes.
+    if (type(tokenizer) is not Tokenizer or
+            tokenizer._rmcp_special_bits[(key >> 6) & 1023] &
+            ((<uint64_t>1) << (key & 63))):
+        return <_Cached*>tokenizer._specials.get(key)
+    return NULL
+
+
 cdef class Tokenizer:
     """Segment text, and create Doc objects with the discovered segment
     boundaries.
@@ -530,6 +541,7 @@ cdef class Tokenizer:
 
         DOCS: https://spacy.io/api/tokenizer#init
         """
+        memset(self._rmcp_special_bits, 0, sizeof(self._rmcp_special_bits))
         self.mem = Pool()
         self._cache = PreshMap()
         self._specials = PreshMap()
@@ -752,6 +764,7 @@ cdef class Tokenizer:
 
     def _flush_specials(self):
         self._special_matcher = PhraseMatcher(self.vocab)
+        memset(self._rmcp_special_bits, 0, sizeof(self._rmcp_special_bits))
         for k in self._specials:
             cached = <_Cached*>self._specials.get(k)
             del self._specials[k]
@@ -856,7 +869,7 @@ cdef class Tokenizer:
                 span = span_data[i]
                 span_start = span[1]
                 span_end = span[2]
-                cached = <_Cached*>self._specials.get(hash_string(span[0]))
+                cached = _rmcp_special_lookup(self, hash_string(span[0]))
                 if cached == NULL:
                     # Copy original tokens if no rule found
                     for j in range(span_end - span_start):
@@ -884,7 +897,7 @@ cdef class Tokenizer:
         cdef bint cache_hit = 0
         cdef int i
         if with_special_cases:
-            cached = <_Cached*>self._specials.get(key)
+            cached = _rmcp_special_lookup(self, key)
             if cached == NULL:
                 specials_hit = False
             else:
@@ -953,14 +966,14 @@ cdef class Tokenizer:
         while string and len(string) != last_size:
             if (rmcp_ascii_word_text(string) if type(self) is Tokenizer and self._rmcp_ascii_word_match and type(string) is str else (self.token_match and self.token_match(string))):
                 break
-            if with_special_cases and self._specials.get(hash_string(string)) != NULL:
+            if with_special_cases and _rmcp_special_lookup(self, hash_string(string)) != NULL:
                 break
             last_size = len(string)
             pre_len = self.find_prefix(string)
             if pre_len != 0:
                 prefix = string[:pre_len]
                 minus_pre = string[pre_len:]
-                if minus_pre and with_special_cases and self._specials.get(hash_string(minus_pre)) != NULL:
+                if minus_pre and with_special_cases and _rmcp_special_lookup(self, hash_string(minus_pre)) != NULL:
                     string = minus_pre
                     prefixes.push_back(self.vocab.get(mem, prefix))
                     break
@@ -968,7 +981,7 @@ cdef class Tokenizer:
             if suf_len != 0:
                 suffix = string[-suf_len:]
                 minus_suf = string[:-suf_len]
-                if minus_suf and with_special_cases and self._specials.get(hash_string(minus_suf)) != NULL:
+                if minus_suf and with_special_cases and _rmcp_special_lookup(self, hash_string(minus_suf)) != NULL:
                     string = minus_suf
                     suffixes.push_back(self.vocab.get(mem, suffix))
                     break
@@ -1164,6 +1177,7 @@ cdef class Tokenizer:
         key = hash_string(string)
         stale_special = <_Cached*>self._specials.get(key)
         self._specials.set(key, cached)
+        self._rmcp_special_bits[(key >> 6) & 1023] |= (<uint64_t>1) << (key & 63)
         if stale_special is not NULL:
             self.mem.free(stale_special)
         self._rules[string] = substrings

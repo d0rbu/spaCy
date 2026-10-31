@@ -1,4 +1,5 @@
 from cymem.cymem cimport Pool
+from libc.stdint cimport uint64_t
 from libcpp.vector cimport vector
 from preshed.maps cimport PreshMap
 
@@ -27,6 +28,7 @@ cdef class Tokenizer:
     cdef int _faster_heuristics
     cdef public int max_cache_size
     cdef bint _rmcp_ascii_word_match
+    cdef uint64_t _rmcp_special_bits[1024]
 
     cdef Doc _tokenize_affixes(self, str string, bint with_special_cases)
     cdef int _apply_special_cases(self, Doc doc) except -1
