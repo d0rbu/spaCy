@@ -137,14 +137,20 @@ cdef extern from *:
     static void rmcp_set_ascii_regex_match_function(PyObject *callback) {
         rmcp_ascii_regex_match_function = PyCFunction_GET_FUNCTION(callback);
     }
-    static int rmcp_ascii_word_text(PyObject *text) {
+    static int rmcp_ascii_word_text(PyObject *text, int mode) {
         if (!PyUnicode_CheckExact(text) || !PyUnicode_IS_ASCII(text)) return 0;
         Py_ssize_t length = PyUnicode_GET_LENGTH(text);
         if (!length) return 0;
         const unsigned char *data = PyUnicode_1BYTE_DATA(text);
-        for (Py_ssize_t i = 0; i < length; ++i) {
-            unsigned int lower = data[i] | 32u;
-            if (lower < 'a' || lower > 'z') return 0;
+        if (mode == 2 && data[0] >= '0' && data[0] <= '9') {
+            for (Py_ssize_t i = 1; i < length; ++i) {
+                if (data[i] < '0' || data[i] > '9') return 0;
+            }
+        } else {
+            for (Py_ssize_t i = 0; i < length; ++i) {
+                unsigned int lower = data[i] | 32u;
+                if (lower < 'a' || lower > 'z') return 0;
+            }
         }
         return 1;
     }
@@ -157,20 +163,26 @@ cdef extern from *:
             return 0;
         PyObject *pattern = PyObject_GetAttrString(owner, "pattern");
         if (pattern == NULL) return -1;
-        int equal = PyUnicode_CheckExact(pattern) &&
-            PyUnicode_CompareWithASCIIString(pattern, "[A-Za-z]+\\Z") == 0;
+        int mode = 0;
+        if (PyUnicode_CheckExact(pattern)) {
+            if (PyUnicode_CompareWithASCIIString(pattern, "[A-Za-z]+\\Z") == 0)
+                mode = 1;
+            else if (PyUnicode_CompareWithASCIIString(pattern,
+                         "(?:[A-Za-z]+|[0-9]+)\\Z") == 0)
+                mode = 2;
+        }
         Py_DECREF(pattern);
-        if (!equal) return 0;
+        if (!mode) return 0;
         PyObject *flags = PyObject_GetAttrString(owner, "flags");
         if (flags == NULL) return -1;
         long value = PyLong_AsLong(flags);
         Py_DECREF(flags);
         if (value == -1 && PyErr_Occurred()) return -1;
-        return value == 32;
+        return value == 32 ? mode : 0;
     }
     """
     void rmcp_set_ascii_regex_match_function(object callback)
-    bint rmcp_ascii_word_text(object text)
+    bint rmcp_ascii_word_text(object text, int mode)
     int rmcp_exact_ascii_pattern(object callback, object pattern_type) except -1
 
 rmcp_set_ascii_regex_match_function(re.compile('').match)
@@ -558,7 +570,7 @@ cdef class Tokenizer:
         # Publish replacement before old destruction can reenter the tokenizer.
         old_token_match = None
         # Destruction may have assigned another callback; classify current state.
-        self._rmcp_ascii_word_match = type(self) is Tokenizer and rmcp_exact_ascii_pattern(self._token_match, _RegexPattern)
+        self._rmcp_ascii_word_match = rmcp_exact_ascii_pattern(self._token_match, _RegexPattern) if type(self) is Tokenizer else 0
         self._reload_special_cases()
 
     @property
@@ -914,7 +926,7 @@ cdef class Tokenizer:
         cdef int orig_size
         cdef const LexemeC* word_lexeme
         orig_size = tokens.length
-        if type(self) is Tokenizer and type(self.vocab) is Vocab and self._rmcp_ascii_word_match and rmcp_ascii_word_text(span):
+        if type(self) is Tokenizer and type(self.vocab) is Vocab and self._rmcp_ascii_word_match and rmcp_ascii_word_text(span, self._rmcp_ascii_word_match):
             # The caller already missed specials/cache. This exact builtin word
             # path breaks _split_affixes without a callback, then repeats the
             # same hash/cache miss in _attach_tokens before appending this lexeme.
@@ -951,7 +963,7 @@ cdef class Tokenizer:
         cdef str minus_suf
         cdef size_t last_size = 0
         while string and len(string) != last_size:
-            if (rmcp_ascii_word_text(string) if type(self) is Tokenizer and self._rmcp_ascii_word_match and type(string) is str else (self.token_match and self.token_match(string))):
+            if (rmcp_ascii_word_text(string, self._rmcp_ascii_word_match) if type(self) is Tokenizer and self._rmcp_ascii_word_match and type(string) is str else (self.token_match and self.token_match(string))):
                 break
             if with_special_cases and self._specials.get(hash_string(string)) != NULL:
                 break
@@ -999,7 +1011,7 @@ cdef class Tokenizer:
             if self._try_specials_and_cache(hash_string(string), tokens, has_special, with_special_cases):
                 pass
             elif (
-                ((rmcp_ascii_word_text(string) if type(self) is Tokenizer and self._rmcp_ascii_word_match and type(string) is str else (self.token_match and self.token_match(string)))) or
+                ((rmcp_ascii_word_text(string, self._rmcp_ascii_word_match) if type(self) is Tokenizer and self._rmcp_ascii_word_match and type(string) is str else (self.token_match and self.token_match(string)))) or
                 (self.url_match and self.url_match(string))
             ):
 

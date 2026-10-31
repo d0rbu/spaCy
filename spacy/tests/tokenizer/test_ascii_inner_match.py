@@ -9,7 +9,7 @@ from spacy.lang.en import English
 
 ATTRS = ["ORTH", "IS_PUNCT", "IS_SPACE", "SPACY", "IDX", "SENT_START", "NORM", "LANG"]
 TEXTS = [
-    "", "alpha", "UPPER lower", "A1", "123", "hello!", "((letters)).",
+    "", "123 00123 1a a1 1.23 1,000 -123 123% ١٢٣ １２３", "alpha", "UPPER lower", "A1", "123", "hello!", "((letters)).",
     "can't won't U.S. example.com", "abc-def", "alpha—beta", "é K İ ı ſ",
     "a\x00b", "a\tb\nc\rd", "  words  ", "Hello... World?!", "。漢字",
     "😀word😀", "A" * 1000, "abc123def", "...alpha...", "a\u2003b",
@@ -18,6 +18,9 @@ TEXTS = [
 
 @pytest.fixture(scope="module", params=[
     (r"[A-Za-z]+\Z", 0),
+    (r"(?:[A-Za-z]+|[0-9]+)\Z", 0),
+    (r"(?:[A-Za-z]+|[0-9]+)\Z", re.ASCII),
+    (r"(?:[A-Za-z]+|[0-9]+)\Z", re.IGNORECASE),
     (r"[A-Za-z]+\Z", re.ASCII),
     (r"[A-Za-z]+\Z", re.IGNORECASE),
     (r"[A-Za-z]+$", 0),
@@ -44,15 +47,17 @@ def test_exact_pattern_and_generic_callback_have_equal_documents(tokenizers, tex
         numpy.testing.assert_array_equal(left.to_array(ATTRS), right.to_array(ATTRS))
 
 
-def test_exact_pattern_roundtrip_and_setter_reclassification():
+@pytest.mark.parametrize("pattern", [r"[A-Za-z]+\Z", r"(?:[A-Za-z]+|[0-9]+)\Z"])
+def test_exact_pattern_roundtrip_and_setter_reclassification(pattern):
     candidate = English().tokenizer
-    candidate.token_match = re.compile(r"[A-Za-z]+\Z").match
+    candidate.token_match = re.compile(pattern).match
     restored = English().tokenizer.from_bytes(candidate.to_bytes())
     for text in TEXTS:
         numpy.testing.assert_array_equal(
             candidate(text).to_array(ATTRS), restored(text).to_array(ATTRS)
         )
-    for match in (None, re.compile(r"\d+\Z").match,
+    for match in (None, re.compile(r"(?:[A-Za-z]+|[0-9]+)\Z").match,
+                  re.compile(r"\d+\Z").match,
                   re.compile(r"[A-Za-z]+\Z").match):
         candidate.token_match = match
         reference = English().tokenizer

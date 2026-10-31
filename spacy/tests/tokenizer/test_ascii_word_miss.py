@@ -25,34 +25,38 @@ def generic_copy(tokenizer):
     )
 
 
+@pytest.mark.parametrize("pattern", [r"[A-Za-z]+\Z", r"(?:[A-Za-z]+|[0-9]+)\Z"])
 @pytest.mark.parametrize("cache_size", [0, 1, 10000])
 @pytest.mark.parametrize("text", [
     "", "lower UPPER Mixed", "I'm repeated repeated another repeated",
     " plain  words\tand\nmore ", "word-thing (word), word123",
     "naïve 漢字 🙂 word café", "a\x00b word", "x" * 10000,
+    "123 00123 1a 1.23 123% ١٢٣ １２３",
     "special ordinary special ordinary", "http://example.com user@example.org",
 ])
-def test_ascii_word_misses_match_generic(text, cache_size):
+def test_ascii_word_misses_match_generic(text, cache_size, pattern):
     fast = English().tokenizer
-    fast.token_match = re.compile(r"[A-Za-z]+\Z").match
+    fast.token_match = re.compile(pattern).match
     fast.max_cache_size = cache_size
     fast.add_special_case("special", [{"ORTH": "special", "NORM": "changed"}])
+    fast.add_special_case("123", [{"ORTH": "123", "NORM": "numeric-exception"}])
     reference = generic_copy(fast)
     for value in [text, text, "other new words", text]:
         assert fast(value).to_bytes() == reference(value).to_bytes()
 
 
-def test_custom_token_match_keeps_callback_sequence():
+@pytest.mark.parametrize("pattern", [r"[A-Za-z]+\Z", r"(?:[A-Za-z]+|[0-9]+)\Z"])
+def test_custom_token_match_keeps_callback_sequence(pattern):
     fast = English().tokenizer
     reference = generic_copy(fast)
     logs = [[], []]
     for tokenizer, log in zip((fast, reference), logs):
         def match(text, log=log):
             log.append(text)
-            return re.match(r"[A-Za-z]+\Z", text)
+            return re.match(pattern, text)
         tokenizer.token_match = match
         tokenizer.max_cache_size = 0
-    for text in ["alpha beta alpha", "I'm plain after special", "ab-cd"]:
+    for text in ["alpha beta alpha", "I'm plain after special", "ab-cd", "123 1a 1.2 ١٢٣"]:
         for log in logs:
             log.clear()
         assert fast(text).to_bytes() == reference(text).to_bytes()
