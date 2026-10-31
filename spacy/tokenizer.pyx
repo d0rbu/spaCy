@@ -148,6 +148,23 @@ cdef extern from *:
         }
         return 1;
     }
+    static int rmcp_ascii_word_terminal(PyObject *text) {
+        if (!PyUnicode_CheckExact(text) || !PyUnicode_IS_ASCII(text)) return 0;
+        const Py_ssize_t n = PyUnicode_GET_LENGTH(text);
+        if (n < 2) return 0;
+        const unsigned char *data = PyUnicode_1BYTE_DATA(text);
+        switch (data[n - 1]) {
+            case ',': case ':': case ';': case '!': case '?':
+            case '(': case ')': case '[': case ']': case '{': case '}':
+            case '<': case '>': case '_': case '#': case '*': case '&': break;
+            default: return 0;
+        }
+        for (Py_ssize_t i = 0; i < n - 1; ++i) {
+            const unsigned int lower = data[i] | 32u;
+            if (lower < 'a' || lower > 'z') return 0;
+        }
+        return 1;
+    }
     static int rmcp_exact_ascii_pattern(PyObject *callback, PyObject *pattern_type) {
         if (!PyCFunction_Check(callback) ||
             PyCFunction_GET_FUNCTION(callback) != rmcp_ascii_regex_match_function)
@@ -171,6 +188,7 @@ cdef extern from *:
     """
     void rmcp_set_ascii_regex_match_function(object callback)
     bint rmcp_ascii_word_text(object text)
+    bint rmcp_ascii_word_terminal(object text)
     int rmcp_exact_ascii_pattern(object callback, object pattern_type) except -1
 
 rmcp_set_ascii_regex_match_function(re.compile('').match)
@@ -913,6 +931,11 @@ cdef class Tokenizer:
         cdef vector[LexemeC*] suffixes
         cdef int orig_size
         cdef const LexemeC* word_lexeme
+        cdef const LexemeC* suffix_lexeme
+        cdef str word
+        cdef str suffix
+        cdef hash_t word_key
+        cdef bint emitted_terminal = False
         orig_size = tokens.length
         if type(self) is Tokenizer and type(self.vocab) is Vocab and self._rmcp_ascii_word_match and rmcp_ascii_word_text(span):
             # The caller already missed specials/cache. This exact builtin word
@@ -926,10 +949,30 @@ cdef class Tokenizer:
                 word_lexeme = self.vocab.get(tokens.mem, span)
             tokens.push_back(word_lexeme, False)
         else:
-            span = self._split_affixes(tokens.mem, span, &prefixes, &suffixes,
-                                       has_special, with_special_cases)
-            self._attach_tokens(tokens, span, &prefixes, &suffixes, has_special,
-                                with_special_cases)
+            if (type(self) is Tokenizer and type(self.vocab) is Vocab and
+                    self._rmcp_ascii_word_match and rmcp_ascii_word_terminal(span) and
+                    rmcp_known_prefix_length(span, self._prefix_search, _rmcp_prefix_callback_ref) == 0 and
+                    rmcp_suffix_callback(self._suffix_search, _rmcp_suffix_function, RMCPSuffixSearch)):
+                # The wrapper always strips this one terminal. Both lexemes
+                # must already exist: cold lexical getters can mutate callbacks,
+                # so their original affix/attachment ordering stays below.
+                word = span[:-1]
+                suffix = span[-1:]
+                word_key = hash_string(word)
+                suffix_lexeme = <const LexemeC*>self.vocab._by_orth.get(hash_string(suffix))
+                word_lexeme = <const LexemeC*>self.vocab._by_orth.get(word_key)
+                if suffix_lexeme != NULL and word_lexeme != NULL:
+                    # Keep the stripped word's special-case/cache priority and
+                    # sticky special flag exactly as in ordinary attachment.
+                    if not self._try_specials_and_cache(word_key, tokens, has_special, with_special_cases):
+                        tokens.push_back(word_lexeme, False)
+                    tokens.push_back(suffix_lexeme, False)
+                    emitted_terminal = True
+            if not emitted_terminal:
+                span = self._split_affixes(tokens.mem, span, &prefixes, &suffixes,
+                                           has_special, with_special_cases)
+                self._attach_tokens(tokens, span, &prefixes, &suffixes, has_special,
+                                    with_special_cases)
         # Exact base instances cannot save while the document's special flag is set.
         # Keep the original call path for native subclasses overriding _save_cached.
         if (type(self) is not Tokenizer or type(self.vocab) is not Vocab or not has_special[0]) and len(self._cache) < self.max_cache_size:
