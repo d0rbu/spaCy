@@ -70,3 +70,22 @@ def test_word_match_setter_and_rule_mutations():
             tokenizer.add_special_case("alpha", [{"ORTH": "alpha", "NORM": "new"}])
         for text in ["alpha beta", "alpha\n beta", "abc-def"]:
             assert fast(text).to_bytes() == reference(text).to_bytes()
+
+
+@pytest.mark.parametrize("cache_size", [0, 1, 10000])
+def test_existing_word_lexemes_reserved_symbols_and_memory_zones(cache_size):
+    fast = English().tokenizer
+    fast.token_match = re.compile(r"[A-Za-z]+\Z").match
+    fast.max_cache_size = cache_size
+    reference = generic_copy(fast)
+    words = ["freshword", "NOUN", "VERB", "ADJ", "ROOT", "ORTH", "alpha", "beta"]
+    for word in words:
+        fast.vocab[word].is_stop = True
+    text = "I'm " + " ".join(words + words)
+    assert fast(text).to_bytes() == reference(text).to_bytes()
+    with fast.vocab.memory_zone():
+        value = text + " zoneonlyword zoneonlyword"
+        assert fast(value).to_bytes() == reference(value).to_bytes()
+    for word in words:
+        fast.vocab[word].is_stop = False
+    assert fast(text).to_bytes() == reference(text).to_bytes()
