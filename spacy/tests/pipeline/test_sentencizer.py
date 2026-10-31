@@ -1,9 +1,33 @@
+import numpy as np
 import pytest
 
 import spacy
 from spacy.lang.en import English
 from spacy.pipeline import Sentencizer
+from spacy.pipeline.sentencizer import rmcp_sentence_starts
 from spacy.tokens import Doc
+
+
+@pytest.mark.parametrize("punct_count", [0, 1, 2, 128, 256])
+@pytest.mark.parametrize("words", [[], ["a"], ["a", ".", ")", "b", "!", "中", " "]])
+def test_native_sentence_state_matches_public_predictions(en_vocab, punct_count, words):
+    punctuation = {".", "a"}
+    punctuation = set(sorted(punctuation)[:punct_count])
+    punctuation.update(f"mark-{i}" for i in range(punct_count - len(punctuation)))
+    component = Sentencizer()
+    component.punct_chars = punctuation
+    doc = Doc(en_vocab, words=words)
+    before = doc.to_array(["ORTH", "IS_PUNCT", "SENT_START"])
+    endings = np.asarray([doc.vocab.strings[p] for p in punctuation], dtype=np.uint64)
+    assert rmcp_sentence_starts(doc, endings).tolist() == component.predict([doc])[0]
+    np.testing.assert_array_equal(
+        before, doc.to_array(["ORTH", "IS_PUNCT", "SENT_START"])
+    )
+
+
+def test_native_sentence_state_rejects_unbounded_punctuation(en_vocab):
+    with pytest.raises(ValueError, match="at most 256"):
+        rmcp_sentence_starts(Doc(en_vocab, words=["a"]), np.arange(257, dtype=np.uint64))
 
 
 def test_sentencizer(en_vocab):

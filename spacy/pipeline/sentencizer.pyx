@@ -4,6 +4,14 @@ import sys
 from typing import Callable, List, Optional
 
 import srsly
+import numpy as np
+cimport numpy as cnp
+cimport cython
+from libc.stdint cimport uint64_t
+from libc.stddef cimport size_t
+from libc.string cimport memset
+from ..attrs cimport IS_PUNCT
+from ..lexeme cimport Lexeme
 
 from ..tokens.doc cimport Doc
 
@@ -14,6 +22,46 @@ from .senter import senter_score
 
 # see #9050
 BACKWARD_OVERWRITE = False
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def rmcp_sentence_starts(Doc doc, const uint64_t[::1] endings):
+    """Predict sentence starts from native token storage without modifying the Doc."""
+    cdef Py_ssize_t i, length = len(doc)
+    cdef size_t slot
+    cdef uint64_t key
+    cdef unsigned char occupied[1024]
+    cdef uint64_t keys[1024]
+    cdef bint seen = False
+    cdef cnp.ndarray[cnp.npy_bool, ndim=1] result
+    cdef cnp.npy_bool[::1] output
+    if endings.shape[0] > 256:
+        raise ValueError("requires at most 256 endings")
+    result = np.zeros(length, dtype=np.bool_)
+    output = result
+    memset(occupied, 0, sizeof(occupied))
+    # Keep the GIL while reading live Doc token and lexeme storage.
+    for i in range(endings.shape[0]):
+        key = endings[i]
+        slot = <size_t>((key ^ (key >> 32)) & 1023)
+        while occupied[slot] and keys[slot] != key:
+            slot = (slot + 1) & 1023
+        occupied[slot] = 1
+        keys[slot] = key
+    if length:
+        output[0] = 1
+    for i in range(length):
+        key = doc.c[i].lex.orth
+        slot = <size_t>((key ^ (key >> 32)) & 1023)
+        while occupied[slot] and keys[slot] != key:
+            slot = (slot + 1) & 1023
+        if occupied[slot]:
+            seen = True
+        elif not Lexeme.c_check_flag(doc.c[i].lex, IS_PUNCT) and seen:
+            output[i] = 1
+            seen = False
+    return result
 
 
 class Sentencizer(Pipe):
