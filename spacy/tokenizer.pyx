@@ -14,6 +14,18 @@ cdef extern from *:
         if (!PyUnicode_CheckExact(text) || !PyUnicode_IS_ASCII(text)) return NULL;
         return (char *)PyUnicode_1BYTE_DATA(text);
     }
+    static char *rmcp_ascii_span(PyObject *text, Py_ssize_t start,
+                                 Py_ssize_t length, char *buffer) {
+        if (length > 128) return NULL;
+        const int kind = PyUnicode_KIND(text);
+        const void *data = PyUnicode_DATA(text);
+        for (Py_ssize_t i = 0; i < length; ++i) {
+            const Py_UCS4 value = PyUnicode_READ(kind, data, start + i);
+            if (value > 127) return NULL;
+            buffer[i] = (char)value;
+        }
+        return buffer;
+    }
     static unsigned rmcp_first_set_bit(uint64_t value) {
         #if defined(__GNUC__) || defined(__clang__)
         return (unsigned)__builtin_ctzll(value);
@@ -107,6 +119,7 @@ cdef extern from *:
     """
     bint rmcp_exact_unicode(object text)
     char *rmcp_ascii_data(object text)
+    char *rmcp_ascii_span(object text, Py_ssize_t start, Py_ssize_t length, char *buffer)
     unsigned rmcp_first_set_bit(uint64_t value)
     uint64_t rmcp_space_transition_block(object text, Py_ssize_t start, unsigned width, int previous_space)
 
@@ -677,7 +690,10 @@ cdef class Tokenizer:
         cdef unsigned block_width
         cdef uint64_t transitions
         cdef char *ascii_data = NULL
-        if type(self) is Tokenizer and type(self.vocab) is Vocab:
+        cdef char ascii_buffer[128]
+        cdef char *span_data
+        cdef bint native_spans = type(self) is Tokenizer and type(self.vocab) is Vocab
+        if native_spans:
             ascii_data = rmcp_ascii_data(string)
         if rmcp_exact_unicode(string):
             # Each character is classified once. Consume every transition in
@@ -690,13 +706,16 @@ cdef class Tokenizer:
                     i = block_start + rmcp_first_set_bit(transitions)
                     transitions &= transitions - 1
                     if start < i:
-                        if ascii_data != NULL:
-                            key = _rmcp_hash_ascii_span(ascii_data, start, i)
+                        span_data = NULL
+                        if native_spans:
+                            span_data = ascii_data + start if ascii_data != NULL else rmcp_ascii_span(string, start, i - start, ascii_buffer)
+                        if span_data != NULL:
+                            key = _rmcp_hash_ascii_span(span_data, 0, i - start)
                         else:
                             span = string[start:i]
                             key = hash_string(span)
                         if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
-                            if ascii_data != NULL:
+                            if span_data != NULL:
                                 span = string[start:i]
                             self._tokenize(doc, span, key, &has_special, with_special_cases)
                     if string[i] == ' ':
@@ -708,13 +727,16 @@ cdef class Tokenizer:
                 block_start += block_width
             i = length
             if start < i:
-                if ascii_data != NULL:
-                    key = _rmcp_hash_ascii_span(ascii_data, start, i)
+                span_data = NULL
+                if native_spans:
+                    span_data = ascii_data + start if ascii_data != NULL else rmcp_ascii_span(string, start, i - start, ascii_buffer)
+                if span_data != NULL:
+                    key = _rmcp_hash_ascii_span(span_data, 0, i - start)
                 else:
                     span = string[start:]
                     key = hash_string(span)
                 if not self._try_specials_and_cache(key, doc, &has_special, with_special_cases):
-                    if ascii_data != NULL:
+                    if span_data != NULL:
                         span = string[start:]
                     self._tokenize(doc, span, key, &has_special, with_special_cases)
                 doc.c[doc.length - 1].spacy = string[-1] == " " and not in_ws

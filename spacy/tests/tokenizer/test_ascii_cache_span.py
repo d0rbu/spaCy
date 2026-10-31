@@ -32,6 +32,12 @@ def generic_copy(tokenizer, cls=GenericTokenizer):
     "http://example.com?q=one user@example.org", "(hello), (world)!",
     "ASCII words with café and \u2003 space", "漢字 🙂 \U00010000",
     "x" * 65 + " " + "x" * 65,
+    "café repeat repeat", "漢字 repeat repeat", "🙂 repeat repeat",
+    "café " + "x" * 127 + " " + "x" * 127,
+    "漢字 " + "x" * 128 + " " + "x" * 128,
+    "🙂 " + "x" * 129 + " " + "x" * 129,
+    "word\u0301 word\u0301 repeat repeat", "é \x00word \x00word",
+    "漢字\u2003ASCII\u2003ASCII", "🙂\u00a0ASCII\u00a0ASCII",
 ])
 def test_cache_hits_match_custom_subclass(text, cache_size):
     fast = English().tokenizer
