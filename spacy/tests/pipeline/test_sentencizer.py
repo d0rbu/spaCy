@@ -1,11 +1,40 @@
+import re
+
 import numpy as np
 import pytest
 
 import spacy
 from spacy.lang.en import English
 from spacy.pipeline import Sentencizer
-from spacy.pipeline.sentencizer import rmcp_sentence_starts
+from spacy.pipeline.sentencizer import rmcp_sentence_offsets, rmcp_sentence_starts
 from spacy.tokens import Doc
+
+
+@pytest.mark.parametrize(
+    "text", ["", " ", "One. Next!", "\nA.\u2003 B?\n", "中。\u0085Next", "A!\U0001f642 B."]
+)
+@pytest.mark.parametrize("short_text", [False, True])
+def test_native_sentence_offsets_match_spans(text, short_text):
+    nlp = English()
+    nlp.add_pipe("sentencizer")
+    doc = nlp(text)
+    original = doc.to_array(["ORTH", "SENT_START"])
+    if short_text:
+        text = text[: len(text) // 2]
+    pattern = re.compile(r"\S")
+    expected = [
+        match.start()
+        for span in doc.sents
+        if (match := pattern.search(text, span.start_char, span.end_char)) is not None
+    ]
+    assert rmcp_sentence_offsets(doc, text) == expected
+    assert np.array_equal(original, doc.to_array(["ORTH", "SENT_START"]))
+
+
+def test_native_sentence_offsets_preserve_missing_annotation_error(en_vocab):
+    doc = Doc(en_vocab, words=["One", "Next"])
+    with pytest.raises(ValueError, match="E030"):
+        rmcp_sentence_offsets(doc, doc.text)
 
 
 @pytest.mark.parametrize("punct_count", [0, 1, 2, 128, 256])

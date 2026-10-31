@@ -10,8 +10,10 @@ cimport cython
 from libc.stdint cimport uint64_t
 from libc.stddef cimport size_t
 from libc.string cimport memset
+from cpython.unicode cimport PyUnicode_GET_LENGTH, PyUnicode_READ_CHAR, Py_UNICODE_ISSPACE
 from ..attrs cimport IS_PUNCT
 from ..lexeme cimport Lexeme
+from ..errors import Errors
 
 from ..tokens.doc cimport Doc
 
@@ -61,6 +63,41 @@ def rmcp_sentence_starts(Doc doc, const uint64_t[::1] endings):
         elif not Lexeme.c_check_flag(doc.c[i].lex, IS_PUNCT) and seen:
             output[i] = 1
             seen = False
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef Py_ssize_t _rmcp_first_nonspace(str text, Py_ssize_t start, Py_ssize_t end):
+    cdef Py_ssize_t limit = PyUnicode_GET_LENGTH(text)
+    if end > limit:
+        end = limit
+    while start < end and Py_UNICODE_ISSPACE(PyUnicode_READ_CHAR(text, start)):
+        start += 1
+    return start if start < end else -1
+
+
+def rmcp_sentence_offsets(Doc doc, str text):
+    """First nonspace positions in native sentence spans, without modifying the Doc.
+
+    Callers with a custom sentence hook or Doc subclass retain their Python spans.
+    """
+    cdef Py_ssize_t start_token = 0, index, first, end
+    cdef list result = []
+    if not doc.has_annotation("SENT_START"):
+        raise ValueError(Errors.E030)
+    for index in range(1, len(doc)):
+        if doc.c[index].sent_start == 1:
+            end = doc.c[index - 1].idx + doc.c[index - 1].lex.length
+            first = _rmcp_first_nonspace(text, doc.c[start_token].idx, end)
+            if first >= 0:
+                result.append(first)
+            start_token = index
+    if start_token < len(doc):
+        end = doc.c[len(doc) - 1].idx + doc.c[len(doc) - 1].lex.length
+        first = _rmcp_first_nonspace(text, doc.c[start_token].idx, end)
+        if first >= 0:
+            result.append(first)
     return result
 
 
